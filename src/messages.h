@@ -11,44 +11,44 @@ typedef struct {
 } VCProof;
 
 
-void serializeVC(ViewChange* sendMessage, char* messageSerialized) {
+void serializeVC(ViewChange* viewChange, char* messageSerialized) {
     uint32_t temp;
-    temp = htonl(sendMessage->type);
+    temp = htonl(viewChange->type);
     memcpy(&messageSerialized[0], &temp, 4);
-    temp = htonl(sendMessage->server_id);
+    temp = htonl(viewChange->server_id);
     memcpy(&messageSerialized[4], &temp, 4);
-    temp = htonl(sendMessage->attempted);
+    temp = htonl(viewChange->attempted);
     memcpy(&messageSerialized[8], &temp, 4);
 }
 
-void serializeVP(VCProof* ackMessage, char* messageSerialized) {
+void serializeVP(VCProof* vcProof, char* messageSerialized) {
     uint32_t temp;
-    temp = htonl(sendMessage->type);
+    temp = htonl(vcProof->type);
     memcpy(&messageSerialized[0], &temp, 4);
-    temp = htonl(sendMessage->server_id);
+    temp = htonl(vcProof->server_id);
     memcpy(&messageSerialized[4], &temp, 4);
-    temp = htonl(sendMessage->installed);
+    temp = htonl(vcProof->installed);
     memcpy(&messageSerialized[8], &temp, 4);
 }
 
-void deserializeVC(char* buffer, ViewChange* dataMessage)
+void deserializeVC(char* buffer, ViewChange* viewChange)
 {
     uint32_t tempo;
     memcpy(&tempo, &buffer[0], 4);
-    dataMessage->type = ntohl(tempo);
+    viewChange->type = ntohl(tempo);
     memcpy(&tempo, &buffer[4], 4);
-    dataMessage->server_id = ntohl(tempo);
+    viewChange->server_id = ntohl(tempo);
     memcpy(&tempo, &buffer[8], 4);
-    dataMessage->attempted = ntohl(tempo);
+    viewChange->attempted = ntohl(tempo);
 }
 
-void deserializeVP(char* buffer, VCProof* ackMessage)
+void deserializeVP(char* buffer, VCProof* vcProof)
 {
     uint32_t tempo;
     memcpy(&tempo, &buffer[0], 4);
-    dataMessage->type = ntohl(tempo);
+    vcProof->type = ntohl(tempo);
     memcpy(&tempo, &buffer[4], 4);
-    dataMessage->server_id = ntohl(tempo);
+    vcProof->server_id = ntohl(tempo);
     memcpy(&tempo, &buffer[8], 4);
-    dataMessage->installed = ntohl(tempo);
+    vcProof->installed = ntohl(tempo);
 }
