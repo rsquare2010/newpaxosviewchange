@@ -16,15 +16,59 @@
 #include <queue>
 #include <vector>
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 
 #define BUFLEN 4096 /* buffer size to read from socket */
 #define MAX_STRING_SIZE 40 /*We assume this to be the Max Size of IP addresses, its fine since its IPv4*/
 #define MAX_PEERS 20 /* My implementation of Paxos assumes a maximum of 20 peers.*/
-#define INITIAL_WAIT_TIME 60 /* Time spent waiting for all the proceesses to be up. */
+#define INITIAL_WAIT_TIME 6 /* Time spent waiting for all the proceesses to be up. */
 
 char pnames[MAX_PEERS][MAX_STRING_SIZE]; //Array to hold the IP address of other processes.
 int psize; // # of other processes.
+int installed = 0; // Default view Id of all views.
+int attempted = 0;
+int myId;
+int testCase = 1;
+struct sockaddr_in servaddr[MAX_PEERS];
 
+void receive(int);
+void sendHeartBeat(int);
+void sendVCProof(int);
+void sendViewChange(int, int);
+
+class VoteCounter {
+    int attemptedVote = 0;
+public:
+    int voteArray[5][5] = {};
+    bool isMajority(int attempt) {
+//        int count = 0;
+//        for (int i = 0; i < 5; i++) {
+//            if (voteArray[attempt][i] > 0) {
+//                count++;
+//            }
+//        }
+        if(getCount(attempt) > psize/2) {
+//            printf("majority\n");
+            return true;
+        }
+        return false;
+    }
+    int getCount(int attempt) {
+        int count = 0;
+        for (int i = 0; i < 5; i++) {
+            if (voteArray[attempt][i] > 0) {
+                count++;
+            }
+        }
+        return count;
+    }
+    void reset(int attempt) {
+        std::fill(std::begin(voteArray[attempt]), std::end(voteArray[attempt]), 0);
+    }
+};
+
+VoteCounter globalVoteCounter;
 //Method to read from host file, resolve the IP address for the container names  and add unique IPs to an array of IP addresses.
 void readFromHostFile( char* myIP) {
     FILE *fp;
@@ -33,7 +77,7 @@ void readFromHostFile( char* myIP) {
     char myIPAddress[40];
     strcpy(myIPAddress, myIP);
 
-    
+
     std::ifstream inFile;
     inFile.open("hostfile.txt");
     if (inFile.fail()) {
@@ -53,8 +97,15 @@ void readFromHostFile( char* myIP) {
         if(host_entry != NULL) {
             IPbufferLocal = inet_ntoa(*((struct in_addr*)host_entry->h_addr_list[0]));
         }
+        if (strcmp(IPbufferLocal, myIPAddress) == 0) {
+            char id = *(temp + 6);
+            myId = id - 48;
+            printf("my id is: %d \n", myId);
+
+        }
         if((IPbufferLocal != NULL) && strcmp(IPbufferLocal, myIPAddress)!=0) {
             strcpy(pnames[index], IPbufferLocal);
+
             index++;
         }
     };
@@ -93,20 +144,330 @@ void readFromHostFile( char* myIP) {
 //    }
 //};
 
+void sendVCProof(int fd) {
+
+    struct sockaddr_in myaddr;//, servaddr[MAX_PEERS];
+    char buf[BUFLEN];
+
+    VCProof vcProofMessage;
+    vcProofMessage.type = 2;
+    vcProofMessage.server_id = myId;   //FIXME global
+    vcProofMessage.installed = installed; //FIXME send global variable
+
+//    for (int i = 0; i < psize; i++) {
+//        memset((char *) &servaddr[i], 0, sizeof(servaddr[i]));
+//        servaddr[i].sin_family = AF_INET;
+//        servaddr[i].sin_port = htons(SERVICE_PORT);
+//        servaddr[i].sin_addr.s_addr = inet_addr(pnames[i]);
+//    }
+
+    serializeVP(&vcProofMessage, &buf[0]);
+    for (int pid = 0; pid < psize; pid ++) {
+        if (sendto(fd, buf, sizeof(vcProofMessage), 0, (struct sockaddr *)&servaddr[pid], sizeof(struct sockaddr_in))==-1) {
+            perror("heartbeat failed");
+        }
+    }
+}
+
+void sendViewChange(int fd, int attempt) {
+
+//    struct sockaddr_in myaddr, servaddr[MAX_PEERS];
+    char buf[BUFLEN];
+
+
+    ViewChange viewChange;
+    viewChange.type = 1;
+    viewChange.server_id = myId; // global
+    viewChange.attempted = attempt; // global
+
+
+//    for (int i = 0; i < psize; i++) {
+//        memset((char *) &servaddr[i], 0, sizeof(servaddr[i]));
+//        servaddr[i].sin_family = AF_INET;
+//        servaddr[i].sin_port = htons(SERVICE_PORT);
+//        servaddr[i].sin_addr.s_addr = inet_addr(pnames[i]);
+//    }
+
+    serializeVC(&viewChange, &buf[0]);
+    for (int pid = 0; pid < psize; pid++) {
+//        printf("sending view change: %d to ipAddress: %s \n", viewChange.attempted, pnames[pid]);
+        if (sendto(fd, buf, sizeof(viewChange), 0, (struct sockaddr *)&servaddr[pid], sizeof(struct sockaddr_in))==-1) {
+            printf("view change failed for %d", pid);
+        }
+    }
+    globalVoteCounter.voteArray[attempt][myId] = 1;
+//    attempted = attempted + 1;
+    //FIXME Add to local counter.
+}
+
+bool isServerUp(int fd, int id) {
+
+    std::chrono::time_point<std::chrono::system_clock> start, end;
+    std::chrono::duration<double> elapsed_seconds;
+//    ViewChange rcvdViewChange;
+    VCProof rcvdVCProof;
+    struct sockaddr_in remaddr;
+    socklen_t addrlen = sizeof(remaddr);
+    char buf[BUFLEN];
+    int recvlen;
+    int nready;
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 5;
+
+    fd_set writefd;
+    FD_ZERO(&writefd);
+    FD_SET(fd, &writefd);
+
+    int n = 10;
+
+    start = std::chrono::system_clock::now();
+    while (elapsed_seconds.count() < 3) {
+        nready = select(fd + 1, &writefd, NULL, NULL, NULL);
+        if(nready == 0) {
+//            printf("The view ID: %d timed out because of inactivity", 0);
+        } else {
+            recvlen = recvfrom(fd, buf, BUFLEN, 0, (struct sockaddr *) &remaddr, &addrlen);
+            if (recvlen > 0) {
+                int temp;
+                memcpy(&temp, &buf[0], 4);
+                if (ntohl(temp) == 1) {
+                    //FIXME handle this
+                } else if (ntohl(temp) == 2) {
+                    deserializeVP(buf, &rcvdVCProof);
+                    if(rcvdVCProof.server_id == id) {
+                        return true;
+                    }
+                }
+            }
+        }
+        end = std::chrono::system_clock::now();
+        elapsed_seconds = end-start;
+    }
+    return false;
+}
+
+void startElection(int fd) {
+
+    //start timer
+    printf("Starting leader election\n");
+    std::chrono::time_point<std::chrono::system_clock> start, end;
+    std::chrono::duration<double> elapsed_seconds;
+    ViewChange rcvdViewChange;
+    VCProof rcvdVCProof;
+    struct sockaddr_in remaddr;
+    socklen_t addrlen = sizeof(remaddr);
+    char buf[BUFLEN];
+    int recvlen;
+    int nready;
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 2;
+
+    fd_set writefd;
+    FD_ZERO(&writefd);
+    FD_SET(fd, &writefd);
+
+    int n = 10;
+
+    start = std::chrono::system_clock::now();
+    globalVoteCounter.reset(attempted);
+    sendViewChange(fd, attempted + 1);
+//    std::thread th2(sendViewChange, fd, attempted +1);
+    attempted++;
+    printf("attempting to install view id: %d \n", attempted);
+    bool isCompletedSuccessfully = false;
+    if(globalVoteCounter.isMajority(attempted)) {
+        // check if that server is up
+        //VCProof
+        //If server up
+//                            printf("inside majority");
+        if (testCase == 3) {
+            if(attempted%5 ==1 && myId==1) {
+                exit(1);
+            }
+        } else if (testCase == 4) {
+            if(attempted%5 ==1 && myId == 1) {
+                exit(1);
+            }
+            if(attempted%5 == 2 && myId == 2) {
+                exit(1);
+            }
+        } else if (testCase == 5) {
+            if(attempted%5 ==1 && myId == 1) {
+                exit(1);
+            }
+            if(attempted%5 == 2 && myId == 2) {
+                exit(1);
+            }
+            if(attempted%5 == 3 && myId == 3) {
+                printf("die!!");
+                exit(1);
+            }
+        }
+    }
+    while (elapsed_seconds.count() < 10) { //Make this global
+
+        nready = select(fd + 1, &writefd, NULL, NULL, NULL);
+        if(nready == 0) {
+//            printf("The view ID: %d timed out because of inactivity", 0);
+        } else if (nready > 0) {
+            recvlen = recvfrom(fd, buf, BUFLEN, 0, (struct sockaddr *)&remaddr, &addrlen);
+            if (recvlen > 0) {
+                int temp;
+                memcpy(&temp, &buf[0], 4);
+                if (ntohl(temp) == 1) {
+                    deserializeVC(buf, &rcvdViewChange);
+                    printf("ViewChange message for view:%d received from %d\n", rcvdViewChange.attempted,rcvdViewChange.server_id);
+                    if( rcvdViewChange.attempted > attempted) {
+//                        attempted = rcvdViewChange.attempted - 1;
+//                        sendViewChange(fd);
+                        globalVoteCounter.voteArray[rcvdViewChange.attempted][rcvdViewChange.server_id] = 1;
+                    } else if (rcvdViewChange.attempted == attempted) {
+                        globalVoteCounter.voteArray[attempted][rcvdViewChange.server_id] = 1;
+                        if(globalVoteCounter.isMajority(attempted)) {
+                            // check if that server is up
+                            //VCProof
+                            //If server up
+//                            printf("inside majority");
+                            if (testCase == 3) {
+                                if(attempted%5 ==1 && myId==1) {
+                                    exit(1);
+                                }
+                            } else if (testCase%5 == 4) {
+                                if(attempted ==1%5 && myId == 1) {
+                                    exit(1);
+                                }
+                                if(attempted%5 == 2 && myId == 2) {
+                                    exit(1);
+                                }
+                            } else if (testCase == 5) {
+                                if(attempted%5 ==1 && myId == 1) {
+                                    exit(1);
+                                }
+                                if(attempted%5 == 2 && myId == 2) {
+                                    exit(1);
+                                }
+                                if(attempted%5 == 3 && myId == 3) {
+                                    printf("die!!");
+                                    exit(1);
+                                }
+                            }
+                            int serverId = rcvdViewChange.attempted % 5;
+                            if (serverId == myId || isServerUp(fd, serverId)) {
+                                printf("majority for serverID:%d \n",rcvdViewChange.attempted);
+                                installed = attempted;
+                                isCompletedSuccessfully = true;
+                            }
+//                            printf("majority not achieved\n");
+                            break;
+                        }
+                    }
+                } else if(ntohl(temp) == 2){
+                    deserializeVP(buf, &rcvdVCProof);
+//                    printf("VCProof message received from %d\n", rcvdVCProof.server_id);
+                    if(rcvdVCProof.installed > installed) {
+                        installed = rcvdVCProof.installed;
+                        isCompletedSuccessfully = true;
+                        printf("higher VC proof from: %d\n", rcvdVCProof.server_id);
+                        break;
+                    }
+                }
+
+
+                //If ciew change increase counter.
+            //if counter more than majority
+            // and that server has sent heartbeat in 3 seconds
+            //            //shift to new view
+            //continue
+            //if vcproof received
+            //shift to new view if VCProof is greater..
+            }
+        } else {
+            printf("select error \n");
+        }
+        end = std::chrono::system_clock::now();
+        elapsed_seconds = end-start;
+    }
+
+//    th2.join();
+    //start election or go back to progress.
+    if(isCompletedSuccessfully) {
+        if(attempted == installed) {
+            sendVCProof(fd);
+        }
+        receive(fd);
+    } else {
+        printf("The number of votes gotten is: %d \n", globalVoteCounter.getCount(attempted));
+        startElection(fd);
+    }
+}
+
+void receive(int fd) {
+    struct sockaddr_in remaddr;
+    socklen_t addrlen = sizeof(remaddr);
+    char buf[BUFLEN];
+    int nready;
+    int recvlen;        /* # bytes in acknowledgement message */
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 5;
+
+    fd_set writefd;
+    FD_ZERO(&writefd);
+    FD_SET(fd, &writefd);
+
+    printf("current view is: %d \n", installed);
+    std::chrono::time_point<std::chrono::system_clock> start, end;
+    std::chrono::duration<double> elapsed_seconds;
+
+    start = std::chrono::system_clock::now();
+
+    while (elapsed_seconds.count() < 10) { //Make this global
+
+        nready = select(fd + 1, &writefd, NULL, NULL, &tv);
+        if(nready == 0) {
+//            printf("The view ID: %d timed out because of inactivity", 0);
+        } else {
+            recvlen = recvfrom(fd, buf, BUFLEN, 0, (struct sockaddr *)&remaddr, &addrlen);
+            if (recvlen > 0) {
+                //Ignore any message here..
+                // if vc proof or viewChange
+                //continue
+                //else
+                //reset timer
+                //check message type
+            }
+        }
+        end = std::chrono::system_clock::now();
+        elapsed_seconds = end-start;
+    }
+
+    if(testCase > 1 || installed == 0) {
+        startElection(fd);
+    }
+
+}
+
+
+
 int main(int argc, char **argv)
 {
     int option = 0; //for opt values
     char* path; //Path to hostfile, this is actually unnecessary.
     int myId; //process Id of this process.
-    int testCase = 0;
+
+    //we need progress timers??
     
-    struct sockaddr_in myaddr, servaddr[MAX_PEERS]; //My address and address to connect to serve
+    struct sockaddr_in myaddr; //My address and address to connect to serve
     struct sockaddr_in remaddr; //Address of the sender in received messages.
     socklen_t addrlen = sizeof(remaddr);
     int fd, i, slen=sizeof(servaddr);
     char buf[BUFLEN];    /* message buffer */
     int recvlen;        /* # bytes in acknowledgement message */
     struct hostent *hp; // To get IP address of this container.
+
 
     
 //    std::priority_queue<SeqMessage,std::vector<SeqMessage>,Comp> pq;//Priority queue of received SeqMessages by this process.
@@ -152,16 +513,10 @@ int main(int argc, char **argv)
     host_entry = gethostbyname(hostbuffer);
     IPbuffer = inet_ntoa(*((struct in_addr*)host_entry->h_addr_list[0]));
 
+
     //The IP address of this process
     printf("my ip is: %s\n", IPbuffer);
     readFromHostFile(IPbuffer);
-
-    /*We derive a unique id for each process by getting the sum of the ascii values of the first 4 characters fo the container name and a random number between 0 and 999.*/
-    int randNumber = rand() % 1000;
-    myId = hostbuffer[0] + hostbuffer [1] + hostbuffer[3] + hostbuffer[4] + randNumber;
-    printf("my Id is:%d\n", myId);
-
-
 
     /* put the host's address into the server address structure */
     for (int i = 0; i < psize; i++) {
@@ -170,8 +525,27 @@ int main(int argc, char **argv)
         servaddr[i].sin_port = htons(SERVICE_PORT);
         servaddr[i].sin_addr.s_addr = inet_addr(pnames[i]);
     }
-    
+
+
+    //Send parallel heartbeat
+    std::thread th1(sendHeartBeat, fd);
+    receive(fd);
+
+    th1.join();
     return 0;
 }
 
+void sendHeartBeat(int fd) {
+    std::chrono::time_point<std::chrono::system_clock> start, end;
+    std::chrono::duration<double> elapsed_seconds;
 
+    start = std::chrono::system_clock::now();
+    for (;;) {
+        if(elapsed_seconds.count() > 3) {
+            sendVCProof(fd);
+            start = std::chrono::system_clock::now();
+        }
+        end = std::chrono::system_clock::now();
+        elapsed_seconds = end-start;
+    }
+}
